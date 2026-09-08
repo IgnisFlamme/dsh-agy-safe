@@ -40,6 +40,11 @@ dsh（deepseek harness，npm 包 `@deepseek-ai/dsh`，全局安装）的模型�
   - **`thinking_tokens ⊆ output_tokens`（BRANCH1，实验判定）**：无工具调用的 step 严丝合缝——校准轮 output=283 = thinking 282 + 可见 "OK\n"≈1；重思考轮收尾 step output=35 = thinking 30 + 可见 "76127\n"≈5；官方样例 582 = 551 + 31 同样吻合。模型调用 agy 内置工具时，工具请求 token 也计入 output（step 残差 120/77 且均紧跟 tool step）。四个观测样本全部满足 `output = thinking + 非思考输出`。
   - 时序证据：思考全部发生在首个可见 token 之前（firstTextDeltaRelMs ≈ 21.2s vs agy 轮处理时长 6.3s），即思考时间落入 DSH 的 TTFT 而非 decode 窗口。
   - 推论：若把含思考的 output 原样上报，DSH Turn TPS 分子按思考 token 过计量——实测校准轮未修正口径下 TPS 会虚高两个数量级。因此插件上报 `outputTokens = 非思考输出差值`、`reasoningTokens = thinking 差值`、`totalTokens = input+output 差值`（provider 口径）、`cacheReadTokens = cache_read 差值`（字段在场时）。
+- **2026-09-08 子代理并发与长轮次实测**（`scripts/verify-subagent-parallel.mjs` 及一次性探针，agy 1.1.27，gemini-3.8-flash medium）：
+  - 并发本身没有问题：6 个并发 agy 进程各自独立流式输出、时间窗真实重叠；dsh 给子代理的请求带自己的 childId 作 sessionId，会话键不冲突（`dsh-agent-loop` 的 `sessionId: this.session.id`，子代理 session id = childId）。
+  - **`--print-timeout` 对 stream-json 会话生效**：不传时默认 5m，单轮超过 5 分钟 agy 会以 `result.status=ERROR, error="timeout waiting for response"`（`duration_seconds≈300`）中止该轮。实测一轮原生工具调用（见下条）常在 5 分钟上下，正好撞上这个默认值。
+  - **模型会绕过哨兵协议、直接调用 agy 内置工具**：此时事件流是 `step_update.step_type=tool`（grep/view_file 等，agy 自己执行、自己回喂结果），没有任何 `agent_response` 文本，插件侧表现为「长时间零 chunk 但进程仍在输出」。轮次时长随之从几十秒膨胀到数分钟（实测 5 分钟内 104 个 tool step、44 万 input token）。该行为是概率性的（同一份请求多次重放，有时守规矩、有时走原生工具），提示词只能降低概率，不能根除。
+  - **缺陷形态**：进程空闲计时器此前只在轮次边界重置，等于把 `idleTimeoutMs`（默认 300s）变成了「单轮硬上限」。子代理轮次超过 300s 时进程在轮次中途被 dispose，宿主看到的是 `TRANSPORT: Antigravity CLI process exited unexpectedly`，本轮零产出；dsh 重试后新进程要重放全量历史（3 万多 token 输入），再次超时被杀，最多 3 次重试全部烧掉。生产会话日志（2026-09-08 20:21）里两个并发 agy 子代理一个正常、一个在 +300.0s 被杀且零产出，正是此形态。
 
 ## 4. 总体设计
 
@@ -59,7 +64,7 @@ dsh（deepseek harness，npm 包 `@deepseek-ai/dsh`，全局安装）的模型�
 
 浏览器侧 `apply` 完成一件事：`ctx.slots.register({name:'settings.section', id:'agy', order:45, label:'Antigravity CLI'}, AgySection)`。
 
-设置段 `llm-agy` 的字段：`agyPath`（默认 `'agy'`）、`defaultEffort`（默认 `'medium'`）、`scratchDir`（默认 `~/.dsh/llm-agy/scratch`）、`idleTimeoutMs`、`streamIdleTimeoutMs`、`retryPolicy`（模型目录由 `agy models` 动态提供，不在设置段里）。
+设置段 `llm-agy` 的字段：`agyPath`（默认 `'agy'`）、`defaultEffort`（默认 `'medium'`）、`scratchDir`（默认 `~/.dsh/llm-agy/scratch`）、`idleTimeoutMs`（默认 300s，进程无输出多久后回收，**按活动重置**）、`streamIdleTimeoutMs`（默认 120s，轮次内事件静默上限）、`turnTimeoutMs`（默认 30min，作为 agy `--print-timeout` 的单轮上限）、`retryPolicy`（模型目录由 `agy models` 动态提供，不在设置段里）。
 
 ### 4.2 组件
 
@@ -80,7 +85,7 @@ dsh（deepseek harness，npm 包 `@deepseek-ai/dsh`，全局安装）的模型�
 ### 4.3 一次请求的数据流
 
 1. dsh agent 循环调 `adapter.stream(options)`，`options` 里有全量 `system/messages/tools`、`reasoningEffort`、`sessionId`、`purpose`、`signal`。
-2. `AgySessionManager` 按会话键找常驻进程；会话键 = `sessionId::purpose`（缺省 purpose 视为 `conversation`）。dsh 的标题/压缩辅助调用与主对话共享 sessionId 但 purpose 不同且可能并发，必须按 purpose 隔离成独立 agy 进程，否则辅助调用的指纹不匹配会把正在流式的主进程杀掉。进程不存在或指纹分叉，则 kill 旧进程、spawn 新进程（`agy --input-format stream-json --output-format stream-json --dangerously-skip-permissions --model <slug> --effort <e>`，cwd 锁定 scratch 目录），首条消息发送压平后的全量历史。进程健在且指纹一致，只发送增量消息（新的 user 输入和 tool-result）。不同 dsh 会话与子代理（childId）各自独立进程，可并行。
+2. `AgySessionManager` 按会话键找常驻进程；会话键 = `sessionId::purpose`（缺省 purpose 视为 `conversation`）。dsh 的标题/压缩辅助调用与主对话共享 sessionId 但 purpose 不同且可能并发，必须按 purpose 隔离成独立 agy 进程，否则辅助调用的指纹不匹配会把正在流式的主进程杀掉。进程不存在或指纹分叉，则 kill 旧进程、spawn 新进程（`agy --input-format stream-json --output-format stream-json --dangerously-skip-permissions --print-timeout <turnTimeoutMs> --model <slug> --effort <e>`，cwd 锁定 scratch 目录），首条消息发送压平后的全量历史。进程健在且指纹一致，只发送增量消息（新的 user 输入和 tool-result）。不同 dsh 会话与子代理（childId）各自独立进程，可并行。
 3. agy 的 NDJSON 输出逐行解析：`step_update` 里 `agent_response` 的 `text_delta` 交给 `ToolCallProtocol` 增量解析，分流为 `text-delta` 或 `tool-call-delta`。
 4. `result` 事件映射为 `usage` chunk 和 `finish` chunk。agy 的 usage 是会话累计值，差分基线归属持有 agy 进程的 `AgySession`（`UsageBaseline`，与累计值同生命周期）：会话复用时跨 `stream()` 调用持久，进程重建（分叉/崩溃/空闲回收/respawn）时随 `spawnProcess()` 归零；`ChunkEmitter` 每轮新建，只做协议映射、不持记账状态。上报口径（依据第 3 节实测）：`inputTokens` = input 差值（agy 口径不含缓存命中）、`outputTokens` = output 差值扣除 thinking 差值（非思考输出）、`reasoningTokens` = thinking 差值、`totalTokens` = input+output 差值（provider 口径）、`cacheReadTokens` = cache_read 差值（字段在场时）。
 5. `options.signal` 触发 abort 时 kill 进程，按 `LlmError('...', 'ABORTED')` 收尾，下次请求自动重建会话。
@@ -98,7 +103,8 @@ dsh（deepseek harness，npm 包 `@deepseek-ai/dsh`，全局安装）的模型�
 ### 4.5 工具调用线协议
 
 - 系统提示中注入工具清单（name + description + JSON Schema）和输出约定：模型要调工具时输出带唯一 sentinel 的围栏块，内容为 `{"name": "...", "arguments": {...}}`，一条回复可含多个块；块外文本即正常文本。
-- 工具规则第 5 条：除非用户明确要求，不创建/修改会话目标（goal 工具如 create_goal），不把普通消息推断为长目标——实测 Gemini 会因宿主提示词里的 goal 工具说明而每次对话都执行目标检查/构造，此约束在插件注入侧声明。
+- 规则开头显式声明「本会话没有任何原生 function-calling 工具，不要自己读文件/搜索/执行命令——那样做对 harness 不可见、也不会被记成工具结果」，并且不再点名 agy 内置工具（点名等于给它们做广告）；工具清单标注为「仅文字说明，不是函数定义」。实测该声明只能降低、不能消除模型直接使用 agy 内置工具的概率（见第 3 节 2026-09-08 实测）。
+- 工具规则最后一条：除非用户明确要求，不创建/修改会话目标（goal 工具如 create_goal），不把普通消息推断为长目标——实测 Gemini 会因宿主提示词里的 goal 工具说明而每次对话都执行目标检查/构造，此约束在插件注入侧声明。
 - `ToolCallProtocol` 是增量状态机，三个状态：正文、疑似围栏、围栏内。流结束时未闭合的围栏按纯文本透传；围栏内 JSON 校验失败同样按纯文本透传。模型输出了什么就呈现什么，不伪造调用成功。
 - tool-call 的 `id` 由插件生成（agy 不提供），格式 `agy_tc_<会话内序号>`。
 
@@ -107,8 +113,9 @@ dsh（deepseek harness，npm 包 `@deepseek-ai/dsh`，全局安装）的模型�
 - 作为模型后端的 agy 进程永远带 `--dangerously-skip-permissions`，agy 侧不出现任何权限弹窗，工具审核全部在 dsh 侧完成。
 - agy 子进程（模型后端与 `--version`/`-p` 探测）只继承最小环境白名单：PATH、SystemRoot、USERPROFILE、HOME、TEMP/APPDATA 等 Windows 基础变量 + `AGY_*`/`AV_*` 前缀变量。宿主环境里的密钥类变量不会进入模型后端进程（`printenv` 读不到）。交互式登录终端例外：那是用户自己的窗口，环境与手动开终端一致。
 - `ToolCallProtocol` 的未闭合工具块缓冲有上限（默认 256KB）：`<<<TOOL_CALL>>>` 后迟迟不来 `<<<END_TOOL_CALL>>>` 时，超过上限后整块按文本透传并回到文本状态，杜绝无界内存增长。
-- 模型后端的 agy 进程 cwd 固定为 scratch 目录，绝不指向用户项目目录。模型即使无视提示词约束调用了 agy 自身工具，文件写入也只会落在 scratch 里。
-- 提示词层再声明一遍不要使用任何内置工具，作为第一道约束。
+- 模型后端的 agy 进程 cwd 固定为 scratch 目录，绝不指向用户项目目录。这限制了模型的**默认**工作目录，但不是沙盒：实测模型绕过哨兵协议直接调 agy 内置工具时可以用绝对路径触达真实目录（2026-09-08 实测 grep 工具直接搜索 `E:\AI\HSR Partner Harness\...`），而 `--dangerously-skip-permissions` 让这些调用直接执行。提示词层是第一道约束，协议内工具调用的审核在 dsh 侧完成；对绕过协议的原生工具调用，插件没有拦截能力，如实记录。
+- 提示词层显式声明不要使用任何内置工具，作为第一道约束（只能降低概率，不能根除，见第 3 节实测）。
+- 模型后端进程的 stderr 被持续排空（内容丢弃）：agy 的 stderr 管道若无人读取，缓冲区写满后进程会阻塞在写入上，表现为整进程静默挂起。
 - 登录终端是用户自己的交互式会话，不适用以上两条，行为与用户手动打开终端跑 `agy` 完全相同。
 
 ### 4.7 模型目录与思考强度
@@ -123,7 +130,10 @@ dsh（deepseek harness，npm 包 `@deepseek-ai/dsh`，全局安装）的模型�
 
 - agy 非零退出或 `status: ERROR` 映射为 `LlmError` 分类：未登录 → `AUTH`（报错文案引导用户到设置页点登录按钮）、未知 slug → `INVALID_REQUEST`、超时 → `TIMEOUT`、进程传输故障 → `TRANSPORT`。
 - `providerRetryPolicy` 只对 `TIMEOUT`、`TRANSPORT`、`RATE_LIMIT`、`SERVER` 开放重试。
-- 空闲看门狗：流超过 `idleTimeoutMs` 无事件则 kill 进程并报 `TIMEOUT`。
+- 三层时间上限，职责分离，互不越权：
+  1. **进程空闲计时器**（`idleTimeoutMs`，默认 300s）：只统计「进程没有任何输出」的时长，**每个事件都重置**；轮次边界也各重置一次。它的职责是回收停轮后闲置的常驻进程，绝不在轮次中途杀进程。
+  2. **流看门狗**（`streamIdleTimeoutMs`，默认 120s）：轮次内连续无事件则 kill 进程并报 `TIMEOUT`（重试策略覆盖）。这是轮次中途卡死的唯一判据。
+  3. **agy 单轮上限**（`turnTimeoutMs`，默认 30min，作为 `--print-timeout` 传给 agy）：超时由 agy 自己中止该轮并返回 `result.status=ERROR`，插件如实上报错误文案，不吞不编。不传这个参数时 agy 默认 5m，会把正常的长轮次（子代理调查轮次常超过 5 分钟）误判成超时。
 - adapter 的 `stream()` 出错时先 yield 本会话收尾块（含 ToolCallProtocol 缓冲冲洗）后**正常返回，不得 rethrow**：dsh-llm 会把迭代器抛错再转成一份终态 finish chunk，双信号会在已结束的流上二次写出（实测宿主演化为未处理的 `write EOF` 崩溃）。
 
 ## 5. 里程碑
@@ -143,16 +153,17 @@ dsh（deepseek harness，npm 包 `@deepseek-ai/dsh`，全局安装）的模型�
 5. 一条回复里多个工具调用，全部正确分发执行。
 6. 长会话触发 dsh 压缩后对话继续正常，分叉检测与重建生效。
 7. 流式中途 abort，agy 进程被杀，会话可继续。
-8. 子代理继承 agy provider 完成任务。
+8. 子代理继承 agy provider 完成任务；**两个 agy 子代理并发启动时都产出结果**，且单个轮次超过 `idleTimeoutMs` 不再被中途杀进程（`scripts/verify-subagent-parallel.mjs` 覆盖）。
 9. 用量面板显示 input / output / cache / thinking token。
-10. 模型会话全程 agy 无权限弹窗；检查 scratch 目录之外无意外文件写入。
+10. 模型会话全程 agy 无权限弹窗；检查 scratch 目录之外无意外文件写入（注意：模型绕过协议直调内置工具时可能用绝对路径触达真实目录，见 4.6）。
 
 ## 7. 风险与对策
 
 | 风险 | 对策 |
 | --- | --- |
-| 模型不守工具调用约定 | sentinel 块设计加容错透传；M0 先测模型服从度，服从度差就限定推荐 slug |
-| agy 内部工具被触发而写文件 | cwd 锁定 scratch 目录，爆炸半径收在沙盒内 |
+| 模型不守工具调用约定 | sentinel 块设计加容错透传；提示词显式声明无原生工具并禁止内置调用；对走原生工具的轮次不作拦截（无手段），靠三层超时如实上报，不伪造成功 |
+| agy 内部工具被触发而写文件 | cwd 锁定 scratch 目录限制默认工作目录；绝对路径触达无法拦截，如实记录（4.6） |
+| 子代理轮次超过 300s 被杀、重试重放全量历史 | 空闲计时器按事件重置，不再是单轮上限；`turnTimeoutMs` 显式传给 `--print-timeout`，避免 agy 默认 5m 误判长轮次 |
 | 分叉检测失效导致上下文错乱 | 指纹链采取保守策略，拿不准一律重建会话 |
 | agy 不输出 thinking 内容 | UI 至少能在用量里展示 `reasoningTokens`，设计不依赖 thinking 文本 |
 | 无桌面环境下登录终端弹不出来 | spawn 失败时设置页给出手动命令兜底文案 |
