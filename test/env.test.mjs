@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildAgyEnv, sessionKeyFor } from '../lib/session.js';
+import { buildAgyArgs, buildAgyEnv, sessionKeyFor } from '../lib/session.js';
 
 test('buildAgyEnv - keeps whitelisted base vars and AGY_*/AV_* prefixes only', () => {
   const env = buildAgyEnv({
@@ -34,4 +34,20 @@ test('sessionKeyFor - separates main conversation from auxiliary purposes', () =
   assert.notEqual(sessionKeyFor('s1', 'compaction'), sessionKeyFor('s1'));
   // 不同会话即使 purpose 相同也互不影响
   assert.notEqual(sessionKeyFor('s1', 'session-title'), sessionKeyFor('s2', 'session-title'));
+});
+
+test('buildAgyArgs - always passes an explicit --print-timeout', () => {
+  const args = buildAgyArgs('gemini-3.8-flash', 'medium', 1_800_000);
+  // agy 缺省 --print-timeout 是 5m，长轮次（子代理调查轮）会被误判超时
+  assert.equal(args[args.indexOf('--print-timeout') + 1], '1800000ms');
+  assert.equal(args[args.indexOf('--model') + 1], 'gemini-3.8-flash');
+  assert.equal(args[args.indexOf('--effort') + 1], 'medium');
+  assert.equal(args[args.indexOf('--input-format') + 1], 'stream-json');
+  assert.equal(args[args.indexOf('--output-format') + 1], 'stream-json');
+  assert.ok(args.includes('--dangerously-skip-permissions'));
+
+  // 无档位模型（claude 系）不传 --effort，agy 会拒绝
+  const noEffort = buildAgyArgs('claude-sonnet-4-6', '', 60_000);
+  assert.equal(noEffort.includes('--effort'), false);
+  assert.equal(noEffort[noEffort.indexOf('--print-timeout') + 1], '60000ms');
 });

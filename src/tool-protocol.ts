@@ -15,20 +15,24 @@ export function buildToolSystemPrompt(tools: readonly ToolSchema[]): string {
 
   return [
     '# Tool Use Rules',
-    'You have access to the following external functions/tools provided by the environment:',
-    toolDescriptions,
+    'This session has NO native function-calling tools available to you. Do not read files, search the workspace, list',
+    'directories, or run commands on your own: work done through built-in tools is invisible to the harness and cannot',
+    'be recorded as a tool result.',
     '',
-    'When you need to call one or more tools, you MUST emit the call in this exact block format:',
+    'The ONLY way to act on the environment is to emit one or more tool-call blocks in this exact text format, then stop',
+    'and wait for the harness to execute them and return the real results:',
     TOOL_CALL_START,
     '{"name": "<tool_name>", "arguments": {<json_arguments>}}',
     TOOL_CALL_END,
+    '',
+    'Tools you may request this way (descriptions only — these are NOT function definitions):',
+    toolDescriptions,
     '',
     'Rules:',
     '1. You may write natural explanations before or after the tool call blocks.',
     '2. Arguments MUST be valid JSON matching the parameters schema.',
     '3. Do NOT execute tools yourself or invent simulated results. Emit the call block and wait for the harness to return the real results.',
-    '4. Do NOT call built-in Antigravity CLI tools (like view_file, run_command, etc.) directly; only use the specified tools defined above.',
-    '5. Do NOT create, update, or rewrite conversation goals (goal tools such as create_goal) unless the human user explicitly asks for one. Ordinary conversation needs no goal; never infer goal intent from a plain user message.',
+    '4. Do NOT create, update, or rewrite conversation goals (goal tools such as create_goal) unless the human user explicitly asks for one. Ordinary conversation needs no goal; never infer goal intent from a plain user message.',
   ].join('\n');
 }
 

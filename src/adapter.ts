@@ -27,6 +27,7 @@ export class AgyAdapter extends LlmAdapter {
       scratchDir: config.scratchDir,
       idleTimeoutMs: config.idleTimeoutMs,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs,
+      turnTimeoutMs: config.turnTimeoutMs,
     });
     this.retryPolicy = resolveRetryPolicy(config.retryPolicy, 'llm-agy: retryPolicy');
   }

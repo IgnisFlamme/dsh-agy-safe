@@ -15,8 +15,9 @@ export const Config = z.object({
   agyPath: z.string().default('agy').description('Path or executable command for Antigravity CLI (agy)'),
   defaultEffort: z.union(['low', 'medium', 'high'] as const).default('medium').description('Default reasoning effort (low, medium, high)'),
   scratchDir: z.string().default(getDefaultScratchDir()).description('Scratch directory used as cwd for background model agy processes'),
-  idleTimeoutMs: z.number().min(1000).default(300_000).description('Idle timeout in milliseconds before releasing cached agy processes'),
+  idleTimeoutMs: z.number().min(1000).default(300_000).description('Idle timeout in milliseconds without any process output before releasing cached agy processes'),
   streamIdleTimeoutMs: z.number().min(1000).default(120_000).description('Timeout in milliseconds waiting for streaming output events'),
+  turnTimeoutMs: z.number().min(1000).default(1_800_000).description('Per-turn wall-clock cap passed to agy as --print-timeout (agy aborts the turn and returns an error result when exceeded)'),
   retryPolicy: RetryPolicySchema,
 });
 
@@ -26,6 +27,7 @@ export type AgyPluginConfig = {
   scratchDir?: string;
   idleTimeoutMs?: number;
   streamIdleTimeoutMs?: number;
+  turnTimeoutMs?: number;
   retryPolicy?: RetryPolicyConfig;
 };
 
@@ -35,6 +37,7 @@ export const DEFAULT_CONFIG: Required<AgyPluginConfig> = {
   scratchDir: getDefaultScratchDir(),
   idleTimeoutMs: 300_000,
   streamIdleTimeoutMs: 120_000,
+  turnTimeoutMs: 1_800_000,
   retryPolicy: {
     mode: 'normal',
     maxRetries: 3,

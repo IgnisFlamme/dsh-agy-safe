@@ -11,6 +11,39 @@ export interface SessionConfig {
   scratchDir: string;
   idleTimeoutMs: number;
   streamIdleTimeoutMs: number;
+  turnTimeoutMs: number;
+}
+
+/**
+ * agy 的 `--print-timeout` 用 Go duration 语法，毫秒是合法单位。
+ * 显式传值的原因见 `SessionConfig.turnTimeoutMs`：agy 默认 5m，会把
+ * 长轮次（子代理的调查轮次常超过 5 分钟）直接判成
+ * `result.status="ERROR", error="timeout waiting for response"`。
+ */
+function formatPrintTimeout(ms: number): string {
+  return `${Math.max(1, Math.round(ms))}ms`;
+}
+
+/**
+ * 模型后端 agy 进程的完整参数表。抽成纯函数以便单测断言
+ * `--print-timeout` 一定在场——agy 缺省 5m 会误杀长轮次。
+ */
+export function buildAgyArgs(model: string, effort: string, turnTimeoutMs: number): string[] {
+  const args = [
+    '--input-format',
+    'stream-json',
+    '--output-format',
+    'stream-json',
+    '--dangerously-skip-permissions',
+    '--print-timeout',
+    formatPrintTimeout(turnTimeoutMs),
+    '--model',
+    model,
+  ];
+  if (effort) {
+    args.push('--effort', effort);
+  }
+  return args;
 }
 
 /**
@@ -96,6 +129,12 @@ export class AgySession implements UsageTracker {
     this.historyFingerprints = [...fps];
   }
 
+  /**
+   * 进程空闲计时器：只统计「进程没有产出任何事件」的时间。
+   * 每一行输出都调用 touch() 重置，所以一个持续产出的长轮次不会被误杀；
+   * 轮次中途真正卡死（静默）由 streamTurn 里的 streamIdleTimeoutMs 看门狗负责。
+   * 轮次边界（streamTurn 进入/退出）也各 touch 一次，用于回收停轮后闲置的进程。
+   */
   touch(): void {
     this.lastActivity = Date.now();
     this.resetIdleTimer();
@@ -122,19 +161,7 @@ export class AgySession implements UsageTracker {
       mkdirSync(this.config.scratchDir, { recursive: true });
     }
 
-    const args = [
-      '--input-format',
-      'stream-json',
-      '--output-format',
-      'stream-json',
-      '--dangerously-skip-permissions',
-      '--model',
-      this.model,
-    ];
-
-    if (this.effort) {
-      args.push('--effort', this.effort);
-    }
+    const args = buildAgyArgs(this.model, this.effort, this.config.turnTimeoutMs);
 
     try {
       this.child = spawn(this.config.agyPath, args, {
@@ -147,6 +174,10 @@ export class AgySession implements UsageTracker {
       this.child.on('error', (err) => {
         // Child process error will be caught during turn streaming
       });
+
+      // stderr 必须被消费：管道缓冲区写满后 agy 会阻塞在 stderr 写入上，
+      // 表现为整进程静默挂起（stdout 也停止推进）。内容不参与协议，直接丢弃。
+      this.child.stderr?.on('data', () => {});
 
       this.resetIdleTimer();
     } catch (err) {
@@ -199,6 +230,8 @@ export class AgySession implements UsageTracker {
     resetWatchdog();
 
     const onLine = (line: string) => {
+      // 有输出 = 进程在推进：重置进程空闲计时器，避免长轮次被当成空闲进程杀掉。
+      this.touch();
       resetWatchdog();
       lineQueue.push(line);
       lineResolve?.();
