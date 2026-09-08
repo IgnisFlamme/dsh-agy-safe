@@ -90,6 +90,7 @@ dsh（deepseek harness，npm 包 `@deepseek-ai/dsh`，全局安装）的模型�
 - 设置面板出现「Antigravity CLI」专页（`settings.section` 插槽，order 取 45，落在模型相关页附近）。页面内容：agy 探测结果（路径、版本）、登录状态行、「打开登录终端」按钮、错误条。
 - 点按钮 → 同源 `POST /api/dsh-agy/login` → 宿主 spawn 一个可见的系统终端窗口跑纯交互式 `agy`（登录场景不带 `--dangerously-skip-permissions`）。Windows 下用 `cmd.exe /c start "" cmd /k agy`，`detached: true` 且 `windowsHide: false`，spawn 后 `unref()` 不阻塞宿主。dsh host 默认只监听 127.0.0.1，窗口就开在用户本机桌面。
 - 登录状态探测分两档：页面加载时只查 agy 二进制存在性、版本、凭据缓存文件是否在位，快速返回；用户点「验证登录」才真实跑一次 `agy -p` 短请求确认凭据有效（这个调用消耗一次模型请求，所以做成显式动作）。
+- verify 实现走 `spawn` + 逐行读 stdout，以 `result` 事件的 `status` 判定成败、判定后立即结束进程，不用 execFile 等进程退出再叠固定短超时：agy 会话模式在 stdin 为打开管道时出完 `result` 仍空等 EOF（见 4.7 的结论），execFile 必须等进程退出才回调，把判定绑在进程寿命上；且 ping 实测耗时常态 13s 起（含启动与一次模型请求），20s 硬超时会误杀慢请求——宿主侧表现为 `Command failed: agy -p ping ...`，而 stdout 里 `result` 其实已是 SUCCESS，设置页据此误报「凭据验证未通过」。
 - 状态轮询：组件每隔几秒拉一次 `/api/dsh-agy/status`，登录窗口关闭后状态自动翻新。
 - 宿主路由照抄样板的防护：同源校验、JSON body 上限、`{ok, value}` / `{ok:false, error:{code, message}}` 信封。
 - 兜底：spawn 失败（比如无桌面环境）时状态区给出可复制的手动命令，让用户自己开终端跑 `agy`。
@@ -115,7 +116,7 @@ dsh（deepseek harness，npm 包 `@deepseek-ai/dsh`，全局安装）的模型�
 - `listModels` 运行时执行一次 `agy models`（stdout 为 `id\t名称` 数据行，spinner 走 stderr），严格解析后按基础模型归组：`-low/-medium/-high` 后缀且显示名匹配 ` (Low)/(Medium)/(High)` 的条目合并为同一基础模型，档位集合为该模型实际存在的档位（如 `gemini-3.1-pro` 只有 low/high；claude 系无档位）。带 5 分钟 TTL 缓存；agy 缺失或命令失败原样抛错，不伪造清单。
 - agy 模型的档位信息在 `--model` 的裸 id（如 `gemini-3.8-flash`）+ `--effort` 传递，已实测：裸 id 合法，组合档位合法；**无档位模型（claude 系）传 `--effort` 会被 agy 以 `invalid model selection` 拒绝**，因此这类模型在 resolve 结果里不声明 reasoning（UI 不出现 effort 选择器），spawn 时也不带 `--effort`。
 - `contextWindow` 用官方 Model Card 数字按基础模型硬编码（Gemini 3.x 全系 1,048,576；Claude 4.6 双子 1,000,000；GPT-OSS 120B 131,072；thinking 档位不改变上下文窗口），表外的模型省略该字段；未知模型回退全档位 + 配置默认 effort。
-- `spawn('agy', ['models'])` 必须 `stdio: ['ignore', 'pipe', 'pipe']`：agy 在 stdin 为打开的管道时会挂起等待 EOF（Windows 实测）。
+- agy 会话类子命令（`models`、`-p ping` 等）spawn 时 stdin 必须置 NUL（`stdio: ['ignore', 'pipe', 'pipe']`）：agy 在 stdin 为打开的管道时会挂起等待 EOF（Windows 实测）。verify/探测这类不发送输入的一次性子进程同理。
 - 设置段无 `models` 字段（目录完全来自 agy models 输出）。
 
 ### 4.8 错误与中止
